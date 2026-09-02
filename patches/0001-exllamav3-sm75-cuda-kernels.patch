@@ -1,0 +1,387 @@
+diff --git a/exllamav3/exllamav3_ext/ptx.cuh b/exllamav3/exllamav3_ext/ptx.cuh
+index be50a68..b53bcb0 100644
+--- a/exllamav3/exllamav3_ext/ptx.cuh
++++ b/exllamav3/exllamav3_ext/ptx.cuh
+@@ -1,5 +1,4 @@
+ #pragma once
+-#include <cuda/atomic>
+ 
+ // Tensor core fragments
+ 
+@@ -48,7 +47,7 @@ __device__ inline void ptx_mma_m8n8k4
+ //
+ // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
+ 
+-// FP16 @ FP16 + FP32 -> FP32
++#if __CUDA_ARCH__ >= 800
+ __device__ inline void ptx_mma_m16n8k16
+ (
+     const FragA& frag_a,
+@@ -78,6 +77,43 @@ __device__ inline void ptx_mma_m16n8k16
+ (
+     const FragA& frag_a,
+     const FragB& frag_b,
++#else
++// FP16 @ FP16 + FP32 -> FP32 (using two m16n8k8 for Turing/sm_75)
++__device__ inline void ptx_mma_m16n8k16
++(
++    const FragA& frag_a,
++    const FragB& frag_b,
++    FragC& frag_c
++)
++{
++    const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
++    const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
++    float* c = reinterpret_cast<float*>(&frag_c);
++    const float* d = reinterpret_cast<const float*>(&frag_c);
++
++    // First m16n8k8: process first 8 columns
++    asm volatile
++    (
++        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
++        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
++        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
++        :  "r"(a[0]), "r"(a[1]),
++           "r"(b[0]),
++           "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3])
++    );
++
++    // Second m16n8k8: process second 8 columns
++    asm volatile
++    (
++        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
++        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
++        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++        :  "r"(a[2]), "r"(a[3]), "r"(b[1])
++    );
++}
++#endif
++
++#if __CUDA_ARCH__ >= 800
+     FragC_h& frag_c
+ )
+ {
+@@ -98,6 +134,47 @@ __device__ inline void ptx_mma_m16n8k16
+     );
+ }
+ 
++#else
++// FP16 @ FP16 + FP16 -> FP16 (using two m16n8k8 for Turing/sm_75)
++__device__ inline void ptx_mma_m16n8k16
++(
++    const FragA& frag_a,
++    const FragB& frag_b,
++    FragC_h& frag_c
++)
++{
++    const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
++    const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
++    uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
++    const uint32_t* d = reinterpret_cast<const uint32_t*>(&frag_c);
++
++    uint32_t temp[2] = {0, 0};
++
++    // First m16n8k8: process first 8 columns
++    asm volatile
++    (
++        "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
++        "{%0,%1}, {%2,%3}, {%4}, {%5,%6};\n"
++        : "=r"(temp[0]), "=r"(temp[1])
++        :  "r"(a[0]), "r"(a[1]), "r"(b[0]),
++           "r"(d[0]), "r"(d[1])
++    );
++
++    c[0] = temp[0];
++    c[1] = temp[1];
++
++    // Second m16n8k8: process second 8 columns
++    asm volatile
++    (
++        "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
++        "{%0,%1}, {%2,%3}, {%4}, {%0,%1};\n"
++        : "+r"(c[0]), "+r"(c[1])
++        :  "r"(a[2]), "r"(a[3]), "r"(b[1])
++    );
++
++}
++#endif
++
+ // Global barrier
+ 
+ __device__ inline void barrier_acquire
+@@ -138,6 +215,10 @@ __device__ inline void barrier_release
+     }
+ }
+ 
++
++#if __CUDA_ARCH__ >= 800
++// Async copy functions for Ampere and later
++
+ // Load global to shared memory, predicated. Seems to produce incorrect code when compiling for Blackwell, but
+ // `if (...) cp_async(...)` compiles to a predicated instruction anyway
+ 
+@@ -197,6 +278,57 @@ __device__ inline void cp_async_wait()
+ {
+     asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
+ }
++#else
++// Synchronous copy functions for Turing (sm_75) and earlier
++
++__device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool pred = true)
++{
++    if (pred)
++    {
++        uint4* dst = reinterpret_cast<uint4*>(smem_ptr);
++        const uint4* src = reinterpret_cast<const uint4*>(glob_ptr);
++        *dst = *src;
++    }
++    else
++    {
++        *reinterpret_cast<uint4*>(smem_ptr) = make_uint4(0,0,0,0);
++    }
++}
++
++// Load global to shared memory
++
++__device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
++{
++    uint4* dst = reinterpret_cast<uint4*>(smem_ptr);
++    const uint4* src = reinterpret_cast<const uint4*>(glob_ptr);
++    *dst = *src;
++}
++
++// Load global to shared memory with cache hint to evict data from L2 ASAP
++
++__device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
++{
++    uint4* dst = reinterpret_cast<uint4*>(smem_ptr);
++    const uint4* src = reinterpret_cast<const uint4*>(glob_ptr);
++    *dst = *src;
++}
++
++// Async copy fence, commit all pending async copies (no-op for synchronous)
++
++__device__ inline void cp_async_fence()
++{
++    // Synchronous copy, no need to fence
++}
++
++// Wait until at most n async groups are still pending (no-op for synchronous)
++
++template <int n>
++__device__ inline void cp_async_wait()
++{
++    // Synchronous copy, no need to wait
++}
++
++#endif
+ 
+ // Load 16x16 matrix fragment from shared memory, directly in tensor core layout
+ 
+@@ -327,20 +459,20 @@ __device__ inline void group_barrier
+ 
+     if (threadIdx.x == 0)
+     {
+-        cuda::atomic_ref<int, cuda::thread_scope_device> counter(barrier_counters_sense[group_id * 2]);
+-        cuda::atomic_ref<int, cuda::thread_scope_device> sense(barrier_counters_sense[group_id * 2 + 1]);
++        int* counter_ptr = &barrier_counters_sense[group_id * 2];
++        int* sense_ptr = &barrier_counters_sense[group_id * 2 + 1];
+ 
+-        int old_sense = sense.load(cuda::memory_order_relaxed);
+-        int old = counter.fetch_add(1, cuda::memory_order_acq_rel);
++        int old_sense = (*sense_ptr);
++        int old = atomicAdd(counter_ptr, 1);
+ 
+         if (old == group_size - 1)
+         {
+-            counter.store(0, cuda::memory_order_relaxed);
+-            sense.store(1 - old_sense, cuda::memory_order_release);
++            *counter_ptr = 0;
++            atomicExch(sense_ptr, 1 - old_sense);
+         }
+         else
+         {
+-            while (sense.load(cuda::memory_order_acquire) == old_sense) __nanosleep(32);
++            while ((*sense_ptr) == old_sense) __nanosleep(32);
+         }
+     }
+ 
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm_inner.cuh b/exllamav3/exllamav3_ext/quant/exl3_gemm_inner.cuh
+index d2b40f2..be48e47 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemm_inner.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemm_inner.cuh
+@@ -4,7 +4,9 @@
+ 
+ // Constants
+ #define EXL3_GEMM_BASE_THREADS 256
+-#define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
++#ifndef SMEM_MAX
++#define SMEM_MAX (60 * 1024)  // Turing-safe cap; largest instantiated shape uses 58,880 bytes
++#endif
+ 
+ #include "exl3_dq.cuh"
+ 
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemv_int8.cu b/exllamav3/exllamav3_ext/quant/exl3_gemv_int8.cu
+index 370b0bb..9a25579 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemv_int8.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemv_int8.cu
+@@ -150,6 +150,25 @@ static bool exl3_gemv_int8_sq
+                + stage + (size_t) 2 * M * 128 * 4;
+     };
+ 
++    // EXL3_ROWS_CLAMP: Turing (sm_75) allows 65536 bytes of shared memory per block
++    // against Ampere's 164KB, so rows_max tuned for newer hardware overflows
++    // (rows_max=512 at M=2 needs exactly 92160). Shrink it until it fits. decomp()
++    // already clamps rows_per to rows_max and recomputes ksplit, so this costs extra
++    // k-splits rather than correctness.
++    {
++        int _dev = 0, _maxsm = 0;
++        cudaGetDevice(&_dev);
++        cudaDeviceGetAttribute(&_maxsm, cudaDevAttrMaxSharedMemoryPerBlockOptin, _dev);
++        size_t _budget = (size_t) ((double) _maxsm * 0.90);
++        int _before = rows_max;
++        while (rows_max > SQ_MINROWS && smem_for(rows_max) > _budget)
++            rows_max -= 8;
++        if (rows_max != _before)
++            fprintf(stderr, "EXL3_ROWS_CLAMP M=%d residual=%d rows_max %d -> %d, smem %zu -> %zu (budget %zu)%c",
++                    M, (int) residual, _before, rows_max,
++                    smem_for(_before), smem_for(rows_max), _budget, 10);
++    }
++
+     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
+     {
+         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(rows_max));
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh
+index e742925..ef07719 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemv_int8_kernel.cuh
+@@ -307,7 +307,11 @@ __device__ __forceinline__ void gemv_int8_row_sums
+ 
+ // The K cap (fall back to the regular kernel in the DRAM-bound regime) is per-arch; see
+ // exl3_gemv_int8_max_k in exl3_gemv_int8.cu
++#if __CUDA_ARCH__ >= 800
+ #define GEMV_STAGE_D 4      // cp.async pipeline depth (rows) for the smem-staged unit
++#else
++#define GEMV_STAGE_D 2      // sm_75 synchronous copy (reduced pipeline depth)
++#endif
+ #define GEMV_STAGE_MAX_BYTES (8 * GEMV_STAGE_D * 16 * 8 * 4)   // 8 warps, K = 8
+ 
+ // Per-slice-scale ("sq") kernel parameters
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemv_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_gemv_kernel.cuh
+index 74201dd..fe7fe4c 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemv_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemv_kernel.cuh
+@@ -38,6 +38,7 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
+     const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
+     const uint32_t* bb = reinterpret_cast<const uint32_t*>(&b);
+     uint32_t* cc = reinterpret_cast<uint32_t*>(&c);
++#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+     asm
+     (
+         "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+@@ -46,6 +47,22 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
+         :  "r"(a0[0]), "r"(a0[1]), "r"(a1[0]), "r"(a1[1]),
+            "r"(bb[0]), "r"(bb[1])
+     );
++#else
++    // Turing (sm_75) has no m16n8k16. A k16 fragment is exactly two k8 fragments
++    // concatenated along K: a01 covers k=0..7, a23 covers k=8..15, and B splits
++    // the same way. Two k8 MMAs accumulating into the same registers are
++    // arithmetically identical to the single k16, no fragment reshuffling needed.
++    asm
++    (
++        "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
++        "{%0,%1}, {%2,%3}, {%4}, {%0,%1};\n"
++        "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
++        "{%0,%1}, {%5,%6}, {%7}, {%0,%1};\n"
++        : "+r"(cc[0]), "+r"(cc[1])
++        :  "r"(a0[0]), "r"(a0[1]), "r"(bb[0]),
++           "r"(a1[0]), "r"(a1[1]), "r"(bb[1])
++    );
++#endif
+ }
+ 
+ // mul1 codebook pair decode via dp4a byte sum (bit-identical to the vabsdiff4 form)
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_kernel_map.cuh b/exllamav3/exllamav3_ext/quant/exl3_kernel_map.cuh
+index 2300fe4..53df56b 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_kernel_map.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_kernel_map.cuh
+@@ -53,7 +53,12 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
+ #define EXL3_GEMM_SHAPE_1     16,     16,    128,     6,     5
+ #define EXL3_GEMM_SHAPE_2     16,     32,    128,     4,     3
+ #define EXL3_GEMM_SHAPE_3     16,     32,    256,     4,     3
++#ifdef EXL3_SM75
++// One fewer pipeline stage so this shape's tiles fit Turing's 64KB of shared memory.
++#define EXL3_GEMM_SHAPE_4     16,     16,    512,     3,     3
++#else
+ #define EXL3_GEMM_SHAPE_4     16,     16,    512,     4,     3
++#endif
+ 
+ #define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16
+ #define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_common.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_common.cuh
+index 2109b27..cc647d0 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_common.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_common.cuh
+@@ -19,8 +19,14 @@
+ #endif
+ 
+ #ifndef SMEM_MAX
++#ifdef EXL3_SM75
++// Turing allows 64KB of shared memory per block against Ampere's 100KB+, so the
++// MoE tiles must fit a smaller budget. Largest instantiated shape uses 58,880 B.
++#define SMEM_MAX (60 * 1024)
++#else
+ #define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
+ #endif
++#endif
+ 
+ #define EXL3_MOE_KERNEL_ARGS                    \
+     const half* __restrict__ hidden_state,      \
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_kernel.cuh
+index fbe0a82..34029c0 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_kernel.cuh
+@@ -271,13 +271,16 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
+     // straggler's in-flight grab could land after the reset and leak into the next launch)
+     if (block_idx == 0 && threadIdx.x == 0)
+     {
+-        cuda::atomic_ref<int, cuda::thread_scope_device> next_ticket(sched[0]);
+-        cuda::atomic_ref<int, cuda::thread_scope_device> retired_groups(sched[1]);
+-        int retired = retired_groups.fetch_add(1, cuda::memory_order_acq_rel);
++        int* next_ticket_ptr = &sched[0];
++        int* retired_groups_ptr = &sched[1];
++        int retired = atomicAdd(retired_groups_ptr, 1);
+         if (retired == num_groups - 1)
+         {
+-            next_ticket.store(0, cuda::memory_order_relaxed);
+-            retired_groups.store(0, cuda::memory_order_relaxed);
++            // Must stay atomic: other blocks may still be grabbing tickets.
++            // atomicExch is the architecture-independent equivalent of the
++            // original relaxed atomic store.
++            atomicExch(next_ticket_ptr, 0);
++            atomicExch(retired_groups_ptr, 0);
+         }
+     }
+ }
+diff --git a/setup.py b/setup.py
+index ae33064..67a8014 100644
+--- a/setup.py
++++ b/setup.py
+@@ -48,6 +48,16 @@ if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
+ if torch and torch_version.hip:
+     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
+ 
++# Turing (sm_75) has 64KB of shared memory per block against Ampere's 100KB+, so a
++# few tile sizes and pipeline depths must shrink. Those are gated on EXL3_SM75 so
++# that Ampere and newer keep their original tuning. Defined only when the build
++# targets sm_75 exclusively.
++_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
++_archs = {a.strip().replace("+PTX", "") for a in _arch_list.replace(";", " ").split() if a.strip()}
++if _archs and _archs <= {"7.5"}:
++    extra_cuda_cflags += ["-DEXL3_SM75"]
++    print("exllamav3: targeting sm_75 only -> defining EXL3_SM75")
++
+ extra_compile_args = {
+     "cxx": extra_cflags,
+     "nvcc": extra_cuda_cflags,

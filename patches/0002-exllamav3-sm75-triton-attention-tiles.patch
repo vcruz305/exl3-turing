@@ -1,0 +1,112 @@
+diff --git a/exllamav3/modules/attention_fn/triton_paged.py b/exllamav3/modules/attention_fn/triton_paged.py
+index d1f1f7d..a350d9b 100644
+--- a/exllamav3/modules/attention_fn/triton_paged.py
++++ b/exllamav3/modules/attention_fn/triton_paged.py
+@@ -25,6 +25,70 @@ except ImportError:
+ from .common import AttnArgs, get_non_causal_span_arglist
+ 
+ 
++# --- Turing (sm_75) shared-memory clamp ---------------------------------------
++# Attention tiles here are sized for Ampere, which has 164KB of shared memory per
++# SM. Turing has 64KB, so the default K+V tiles across num_stages overflow and the
++# kernel fails at launch with OutOfResources. Shrink block_n until it fits rather
++# than reducing num_stages, which would cost the pipelining.
++_smem_limit_cache = {}
++
++
++def _max_smem(device):
++    idx = device.index if getattr(device, "index", None) is not None else 0
++    lim = _smem_limit_cache.get(idx)
++    if lim is None:
++        props = torch.cuda.get_device_properties(idx)
++        lim = getattr(props, "shared_memory_per_block_optin", 0)
++        if not lim:
++            lim = 65536 if props.major < 8 else 101376
++        _smem_limit_cache[idx] = lim
++    return lim
++
++
++def _clamp_block_n_for_smem(device, block_n, head_dim, max_stages=3, margin=0.9):
++    # K and V tiles, fp16, held across max_stages pipeline stages.
++    budget = int(_max_smem(device) * margin)
++    while block_n > 16 and block_n * head_dim * 4 * max_stages > budget:
++        block_n //= 2
++    return block_n
++
++
++def _clamp_tiles_for_smem(device, block_m, block_n, head_dim, margin=0.9):
++    """Largest (block_m, block_n) whose Q/K/V tiles fit this device's shared memory.
++
++    Turing allows 64KB per block against Ampere's 164KB, so tiles tuned on newer
++    hardware overflow at launch. Shrink block_n first (it is doubly weighted, and
++    the K loop simply runs more iterations), then block_m.
++    """
++    budget = int(_max_smem(device) * margin)
++
++    def need(bm, bn):
++        return bm * head_dim * 2 + bn * head_dim * 8
++
++    while need(block_m, block_n) > budget:
++        if block_n > 16:
++            block_n //= 2
++        elif block_m > 16:
++            block_m //= 2
++        else:
++            break
++    return block_m, block_n
++
++
++def _clamp_stages_for_smem(device, block_n, head_dim, ns, margin=0.9):
++    """Largest pipeline depth whose K+V tiles fit this device's shared memory.
++
++    Turing allows 64KB per block against Ampere's 164KB, so depths tuned on newer
++    hardware overflow at launch. Returns at least 1: a depth-1 pipeline is slow but
++    always fits.
++    """
++    budget = int(_max_smem(device) * margin)
++    per_stage = max(1, block_n * head_dim * 4)
++    return max(1, min(int(ns), budget // per_stage))
++# ------------------------------------------------------------------------------
++
++
++
+ def _is_power_of_2(x: int) -> bool:
+     return x > 0 and (x & (x - 1)) == 0
+ 
+@@ -1139,6 +1203,7 @@ def paged_attn_triton_decode(
+ 
+     if block_n is None:
+         block_n = max(16, 8192 // head_dim)   # K + V tiles in smem across num_stages
++        block_n = _clamp_block_n_for_smem(q.device, block_n, head_dim)
+ 
+     group_size = n_q_heads // n_kv_heads
+     block_m = triton.next_power_of_2(q_len)
+@@ -1788,6 +1853,7 @@ def paged_attn_triton_prefill(
+     block_n = block_n or cfg[1]
+     num_warps = num_warps or cfg[2]
+     num_stages = num_stages or cfg[3]
++    block_m, block_n = _clamp_tiles_for_smem(q.device, block_m, block_n, head_dim)
+     if qc is not None:
+         # compact plane tiles stage fewer smem bytes than fp16: wider kv tiles pay off. Wide
+         # bit widths at large head_dim overstep the ~99 KB smem budget with the non-causal loop
+@@ -1796,6 +1862,12 @@ def paged_attn_triton_prefill(
+         block_n = max(16, min(128, 16384 // head_dim))
+         if head_dim >= 256 and qck + qcv >= 13 and block_n > 16:
+             block_n //= 2
++        # The compact-cache override above runs after the generic shared-memory clamp.
++        # On Turing, a nominal 64 KiB K+V tile compiles to 65,664 bytes even with one
++        # pipeline stage, 128 bytes beyond the per-block limit. Reapply the device budget
++        # after the override; head_dim=128 selects BLOCK_N=64 and head_dim=256 selects 32.
++        if torch.cuda.get_device_capability(q.device)[0] < 8:
++            block_n = _clamp_block_n_for_smem(q.device, block_n, head_dim, max_stages=1)
+ 
+     num_pages_per_seq = block_table.shape[1]
+     q_blocks = triton.cdiv(q_len, block_m)
+@@ -1852,6 +1924,7 @@ def paged_attn_triton_prefill(
+             q_blocks * bsz * n_q_heads * num_splits * block_m * head_dim,
+         ) >= 1 << 31
+         def launch(ns):
++            ns = _clamp_stages_for_smem(q.device, block_n, head_dim, ns)
+             _paged_attn_prefill_kernel[grid](
+                 q, k_cache, v_cache, block_table, cache_seqlens, out,
+                 partial_o, partial_ml, k_scales, v_scales, h32,

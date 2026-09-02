@@ -1,0 +1,33 @@
+diff --git a/common/hardware.py b/common/hardware.py
+index e6bec44..ca47b43 100644
+--- a/common/hardware.py
++++ b/common/hardware.py
+@@ -5,15 +5,19 @@ def hardware_supports_exllamav3(gpu_device_list: list[int]):
+     """
+     Check whether all GPUs in the list can run ExLlamaV3.
+ 
+-    ExLlamaV3 requires compute capability 8.0 (Ampere) or higher
+-    and doesn't support ROCm.
+-    """
++    Upstream ExLlamaV3 requires compute capability 8.0 (Ampere) or higher.
++    This install runs against a Turing (sm_75) port of exllamav3, so 7.5 is
++    accepted as well.
+ 
+-    min_compute_capability = min(
+-        torch.cuda.get_device_capability(device=device_idx)[0] for device_idx in gpu_device_list
+-    )
++    Volta (7.0) is still rejected: the port relies on ldmatrix and
++    mma.m16n8k8, both of which are sm_75 or newer.
++    """
+ 
+-    if torch.version.hip or min_compute_capability < 8:
++    if torch.version.hip:
+         return False
+-    else:
+-        return True
++
++    devices = gpu_device_list or [torch.cuda.current_device()]
++    return all(
++        torch.cuda.get_device_capability(device=device_idx) >= (7, 5)
++        for device_idx in devices
++    )
