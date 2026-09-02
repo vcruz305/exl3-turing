@@ -66,33 +66,55 @@ nothing; `block_m` is the term that has to move.
 `atomicAdd` / `atomicExch`. Keep `atomicExch` for the resets: other blocks may
 still be grabbing tickets, and a plain store there is a race.
 
-## Install
+## Quickstart against upstream
+
+Verified: all four exllamav3 patches apply cleanly to a pristine checkout at the
+base commit below, and the tabbyAPI patch applies at its own.
 
 ```bash
-git clone https://github.com/turboderp-org/exllamav3
-cd exllamav3 && git checkout 0c49587a7c235e6303a6bbedc8b665272ad3a2ea
-for p in /path/to/patches/000[1-4]*.patch; do git apply "$p"; done
+# 1. upstream at the commit these were cut against
+git clone https://github.com/turboderp-org/exllamav3 && cd exllamav3
+git checkout 0c49587a7c235e6303a6bbedc8b665272ad3a2ea
 
-python -m venv ~/exl3venv && ~/exl3venv/bin/pip install torch --index-url <cuXXX>
-TORCH_CUDA_ARCH_LIST=7.5 CUDA_HOME=/usr/local/cuda-12.8 \
-  ~/exl3venv/bin/pip install -e . --no-build-isolation
+# 2. apply. --check first so a bad rebase fails loudly
+for p in ../exl3-turing/patches/000[1-4]*.patch; do
+  git apply --check "$p" && git apply "$p" || echo "FAILED $p"
+done
+
+# 3. build for Turing
+python -m venv ~/exl3venv
+~/exl3venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128
+TORCH_CUDA_ARCH_LIST=7.5 CUDA_HOME=/usr/local/cuda-12.8   ~/exl3venv/bin/pip install -e . --no-build-isolation
+
+# 4. confirm
+~/exl3venv/bin/python -c "import exllamav3, torch; print(torch.cuda.get_device_capability(0))"
 ```
 
 `TORCH_CUDA_ARCH_LIST=7.5` matters twice: it selects the kernels, and `setup.py`
-uses it to define `EXL3_SM75`, which gates the shared-memory accommodations. Build
-for any other arch and you get upstream behaviour.
+reads it to define `EXL3_SM75`, which gates the shared-memory accommodations.
+Build for any other architecture and you get upstream tuning unchanged.
 
-For TabbyAPI, apply `0005` and install **without extras**, since the pinned
-`exllamav3` wheels have no sm_75 kernels:
+Ninja must be on `PATH`, or the build falls back to serial distutils and takes
+hours.
+
+### TabbyAPI
 
 ```bash
-pip install -e ./tabbyAPI          # no [cu128] etc
-pip uninstall -y exllamav3         # remove any wheel that would shadow the source
+git clone https://github.com/theroyallab/tabbyAPI && cd tabbyAPI
+git checkout fcc1a1078e1f766dad305045c7c4d30aaefa6458
+git apply ../exl3-turing/patches/0005-tabbyapi-allow-sm75.patch
+
+pip install -e .            # NO extras: the pinned exllamav3 wheels have no sm_75 kernels
+pip uninstall -y exllamav3  # remove any wheel that would shadow the patched source
 PYTHONPATH=/path/to/exllamav3 python main.py
 ```
 
 `PYTHONPATH` is load-bearing. Without it TabbyAPI imports a stock exllamav3 and
 dies on sm_75.
+
+See [AGENTS.md](AGENTS.md) for verification steps and the failure modes worth
+knowing before you debug something.
+
 
 ## Config that works
 
