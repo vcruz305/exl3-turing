@@ -164,11 +164,41 @@ the symptom above. Single attempt with a guard.
 453, 508 and 463 characters. Do not try to prove MTP is lossless by diffing
 output. Compare category scores instead.
 
+## Testing the Ampere path
+
+I only have a Turing card, so the one claim I cannot verify myself is that these
+patches leave Ampere and newer untouched. Everything is gated behind
+`__CUDA_ARCH__ >= 800` or `EXL3_SM75`, but that is reasoning, not evidence.
+
+If you have a 30-series or newer card, `tools/ampere-verify.sh` checks it:
+
+```bash
+git clone https://github.com/vcruz305/exl3-turing && cd exl3-turing
+./tools/ampere-verify.sh --quick          # static check, about a minute, no build
+
+export EXL3_TEST_MODEL=/path/to/any/exl3/model
+./tools/ampere-verify.sh                  # full A/B, builds clean and patched
+```
+
+`--quick` confirms the Turing accommodations stay switched off without
+`EXL3_SM75`: `SMEM_MAX` should resolve to `90 * 1024`, `GEMM_SHAPE_4` should keep
+4 pipeline stages, and the MoE atomics should be unguarded only in the sense of
+using `atomicExch` rather than a plain store.
+
+The full run builds pristine upstream and the patched tree at the same commit,
+for your own architecture, and benchmarks both. **They should match within
+run-to-run noise.** It also fails loudly if `EXL3_SM75` gets defined on a non-7.5
+build, which would mean the gate is leaking.
+
+If patched comes out slower, please open an issue here with both numbers. That is
+a real bug and I want to know before this goes upstream.
+
 ## Limitations
 
-- **Ampere and newer are untested.** Every change is behind `__CUDA_ARCH__ >= 800`
-  or `EXL3_SM75`, so upstream paths should be untouched, but I have no Ampere card
-  to prove it.
+- **Ampere and newer are untested by me.** Every change is behind
+  `__CUDA_ARCH__ >= 800` or `EXL3_SM75`, so upstream paths should be untouched, but
+  I have no Ampere card. See [Testing the Ampere path](#testing-the-ampere-path) if
+  you can help close this.
 - Correctness on Turing is behavioural, not numerical: coherent output plus
   benchmark scores matching the pre-port baseline. No bit-exact comparison against
   a reference implementation.
