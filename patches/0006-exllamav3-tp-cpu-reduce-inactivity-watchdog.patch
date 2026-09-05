@@ -1,0 +1,71 @@
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu
+index 7b3011d..206cec2 100644
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu
+@@ -14,6 +14,7 @@ namespace cg = cooperative_groups;
+ #include <thread>
+ #include <cstring>
+ #include <chrono>
++#include <cstdlib>
+ #include "../avx2_target.h"
+ #include "all_reduce_cpu_avx2.h"
+ 
+@@ -92,7 +93,18 @@ void run_cpu_reduce_jobs
+     uint8_t* shbuf_ptr = (uint8_t*) shbuf;
+     ReduceJob current_job;
+ 
+-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
++    // Inactivity watchdog. The deadline is refreshed on every successful job pop and every
++    // completed reduction, so it measures time since *last progress* rather than total elapsed
++    // pass time. A long forward pass legitimately runs this queue dry between layers for
++    // multi-second stretches; a fixed "since process start" deadline would fire spuriously.
++    int64_t timeout_ms = 120000; // default 120s, tunable via EXL3_TP_CPU_REDUCE_TIMEOUT_MS
++    if (const char* env = getenv("EXL3_TP_CPU_REDUCE_TIMEOUT_MS"))
++    {
++        long long v = atoll(env);
++        if (v > 0) timeout_ms = (int64_t) v;
++    }
++    const auto timeout = std::chrono::milliseconds(timeout_ms);
++    auto last_activity = std::chrono::steady_clock::now();
+     while (true)
+     {
+         // Wait for next job. Jobs are pushed just-in-time by the master's dispatch loop, so the
+@@ -104,7 +116,11 @@ void run_cpu_reduce_jobs
+         while (true)
+         {
+             if (pop_reduce_job(ctx, current_job))
++            {
++                // Progress: a job was successfully dequeued. Refresh the inactivity clock.
++                last_activity = std::chrono::steady_clock::now();
+                 break;
++            }
+             if (++spins < 65536)
+             {
+                 #ifdef __linux__
+@@ -115,10 +131,13 @@ void run_cpu_reduce_jobs
+                 continue;
+             }
+             std::this_thread::sleep_for(std::chrono::microseconds(50));
+-            if (std::chrono::steady_clock::now() > deadline)
++            // Only the *idle* stretch between jobs counts toward the deadline; total pass
++            // runtime resets it whenever a job arrives, so long passes no longer trip this.
++            if (std::chrono::steady_clock::now() - last_activity > timeout)
+             {
+-                // After 50 seconds of waiting for the queue to build, something surely crashed
+-                printf(" ## CPU reduce wait timeout");
++                // Nothing has arrived for the full inactivity window, so a worker must have
++                // stalled or a CUDA operation failed before a reduce could be queued.
++                printf(" ## CPU reduce wait timeout (no progress for %lld ms)", (long long) timeout_ms);
+                 TORCH_CHECK(false, "CPU reduce wait timeout");
+             }
+         }
+@@ -137,6 +156,9 @@ void run_cpu_reduce_jobs
+             shbuf_ptr,
+             shbuf_size
+         );
++
++        // Reduction completed: refresh the inactivity clock.
++        last_activity = std::chrono::steady_clock::now();
+     }
+ }
+ 

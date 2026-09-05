@@ -20,10 +20,15 @@ git checkout 0c49587a7c235e6303a6bbedc8b665272ad3a2ea
 for p in ../exl3-turing/patches/000[1-4]*.patch; do
   git apply --check "$p" && git apply "$p" || echo "FAILED $p"
 done
+# optional: multi-GPU Tensor-Parallel fix (inactivity watchdog)
+git apply ../exl3-turing/patches/0006-exllamav3-tp-cpu-reduce-inactivity-watchdog.patch
 ```
 
 Always `--check` first. All four are verified to apply cleanly at that commit.
 On a newer upstream expect `ptx.cuh` and `triton_paged.py` to need rebasing.
+`0006` is independent and optional: it fixes the native-TP watchdog so the
+CPU-reduce deadline measures inactivity rather than total pass time, which lets
+long forward passes run over multiple GPUs without a spurious timeout.
 
 ## Building
 
