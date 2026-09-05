@@ -37,6 +37,7 @@ token per weight-read pass.
 | `0003-exllamav3-qwen35-vl-context-length` | Qwen3.5 VL context bug, not Turing specific |
 | `0004-exllamav3-chat-generator-chunk-size` | adds `-gcs` prefill chunk flag |
 | `0005-tabbyapi-allow-sm75` | TabbyAPI rejects anything below cc 8.0 |
+| `0006-exllamav3-tp-cpu-reduce-inactivity-watchdog` | fix the native-TP CPU-reduce watchdog to measure inactivity, not pass time; enables long passes over multiple GPUs |
 
 ### The three real problems
 
@@ -146,6 +147,92 @@ MTP forward pass faster than it earns accepted tokens.
 
 `draft_mode: ngram` gets 11.9% acceptance on this model. Not worth it.
 `dynamic_draft` gave no gain over fixed ndt=1.
+
+## Multiple GPUs / Tensor Parallel
+
+The four exllamav3 patches above are single-GPU. Nothing in this pack changes the
+Tensor-Parallel stack, so multi-GPU works exactly as upstream does — with two
+sm_75-specific gotchas and one genuinely new patch (`0006`).
+
+### The `0006` watchdog fix
+
+ExLlamaV3's **native** TP backend reduces across GPUs by passing slices through
+CPU shared memory, and a dedicated CPU process runs the reduction. Its watchdog
+(`run_cpu_reduce_jobs` in `all_reduce_cpu.cu`) used to fire on *total process
+time*: the deadline was 50 seconds from the start of the queue loop, so a long
+forward pass that legitimately ran the queue dry between layers for a few seconds
+would trip `CPU reduce wait timeout` even though nothing was broken.
+
+`0006-exllamav3-tp-cpu-reduce-inactivity-watchdog.patch` turns that into an
+*inactivity* watchdog. The deadline now resets on every successful dequeue and on
+every completed reduction, so it measures time since *last progress* instead of
+pass duration. Long passes no longer trip it; a genuinely stalled rank still does.
+
+The window is tunable and defaults to 120s:
+
+```bash
+EXL3_TP_CPU_REDUCE_TIMEOUT_MS=120000
+```
+
+### Native vs NCCL backend
+
+Native TP needs the CPU reduce process to keep up with the GPU workers. On a
+heavily undersized host (2 cores / 4 threads) the reduce process is starved and
+native TP stalls **even with** the `0006` fix — this is a real bottleneck, not a
+tunable timeout. The fix was to switch the TP backend to NCCL, which keeps
+all-reduce off the CPU:
+
+```yaml
+model:
+  tensor_parallel: true
+  tensor_parallel_backend: nccl
+```
+
+NCCL is the backend this PR is validated against. Native is left intact and works
+on hosts with enough CPU headroom; the `0006` patch also makes its watchdog behave
+correctly there.
+
+### Env for a multi-GPU Turing ring
+
+These GTX 1660s are PCIe peer-attached (no NVLink/P2P, no InfiniBand), so disable
+both and turn on NCCL diagnostics to attribute faults:
+
+```bash
+NCCL_P2P_DISABLE=1
+NCCL_IB_DISABLE=1
+NCCL_DEBUG=INFO
+```
+
+### Shared memory
+
+Torch distributed / NCCL and the native CPU reduce both use `/dev/shm`. Under
+Docker, raise the container's `/dev/shm` well above the 64MB default:
+
+```yaml
+shm_size: "16gb"
+```
+
+### Layer split
+
+Spread weights across the identical cards with an explicit split rather than
+autosplit, which tends to pack the model onto one card and OOM it:
+
+```yaml
+model:
+  gpu_split_auto: false
+  gpu_split: [3.5, 3.5, 3.5, 3.5, 3.5]
+  autosplit_reserve: [384, 256, 256, 256, 256]
+```
+
+### MTP on multi-GPU
+
+MTP speculative batching over a multi-GPU layer split can crash the
+cooperative-GEMV kernel. Boot with `draft_mode: disabled` first, then opt back
+into `mtp` only once proven stable on your topology.
+
+Validated on 5x GTX 1660 (sm_75) with the NCCL backend and zero native fallback:
+NCCL init `world_size 5`, all ranks joined, warmup complete, inference passed (no
+`Falling back to native` in the logs).
 
 ## Things that cost me time
 
